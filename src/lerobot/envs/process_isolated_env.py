@@ -28,11 +28,17 @@ def _child_main(
     autoreset_mode: Any,
 ) -> None:
     """Entry point for the worker process that owns the VectorEnv."""
+    import faulthandler
     import sys
+
+    # Print C-level traceback on SIGSEGV/SIGBUS/etc to stderr.
+    faulthandler.enable(file=sys.stderr, all_threads=True)
 
     env: gym.vector.SyncVectorEnv | None = None
     try:
+        print("[ProcessIsolatedEnv child] unpickling env_fns...", file=sys.stderr, flush=True)
         env_fns = pickle.loads(env_fns_bytes)
+        print("[ProcessIsolatedEnv child] creating SyncVectorEnv...", file=sys.stderr, flush=True)
         env = gym.vector.SyncVectorEnv(env_fns, autoreset_mode=autoreset_mode)
 
         # Send back metadata the parent needs for proxying.

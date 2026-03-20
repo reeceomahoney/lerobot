@@ -144,6 +144,11 @@ class ProcessIsolatedVectorEnv:
         env_fns: Sequence[Callable[[], Any]],
         autoreset_mode: Any = None,
     ) -> None:
+        self._closed = False
+
+        if autoreset_mode is None:
+            autoreset_mode = gym.vector.AutoresetMode.NEXT_STEP
+
         # Serialize env_fns with cloudpickle (handles closures, lambdas, etc.)
         # so they survive the spawn boundary.
         env_fns_bytes = cloudpickle.dumps(list(env_fns))
@@ -176,8 +181,6 @@ class ProcessIsolatedVectorEnv:
         for i, attrs in enumerate(meta["sub_env_attrs"]):
             proxy = _SubEnvProxy(attrs, render_fn=lambda idx=i: self._render_one(idx))
             self.envs.append(proxy)
-
-        self._closed = False
 
     # -- Core VectorEnv interface ---------------------------------------------
 

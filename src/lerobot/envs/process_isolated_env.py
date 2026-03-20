@@ -225,6 +225,9 @@ def _collect_metadata(env) -> dict[str, Any]:
         attrs["__class_name__"] = type(e).__name__
         sub_attrs.append(attrs)
 
+    # Grab metadata from the first sub-env (used for render_fps etc.)
+    metadata = getattr(env.envs[0], "metadata", {}) if env.envs else {}
+
     return {
         "num_envs": env.num_envs,
         "observation_space": env.observation_space,
@@ -232,6 +235,7 @@ def _collect_metadata(env) -> dict[str, Any]:
         "action_space": env.action_space,
         "single_action_space": env.single_action_space,
         "sub_env_attrs": sub_attrs,
+        "metadata": metadata,
     }
 
 
@@ -303,6 +307,7 @@ class ProcessIsolatedVectorEnv:
         self.single_observation_space = meta["single_observation_space"]
         self.action_space = meta["action_space"]
         self.single_action_space = meta["single_action_space"]
+        self.metadata = meta.get("metadata", {})
 
         # Build proxy objects for env.envs[i].
         self.envs: list[_SubEnvProxy] = []
@@ -315,6 +320,11 @@ class ProcessIsolatedVectorEnv:
     @property
     def num_envs(self) -> int:
         return self._num_envs
+
+    @property
+    def unwrapped(self):
+        """Return self so that ``env.unwrapped.metadata`` works."""
+        return self
 
     def reset(self, *, seed: list[int] | int | None = None, options: dict | None = None) -> tuple:
         kwargs: dict[str, Any] = {}

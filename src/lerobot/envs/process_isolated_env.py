@@ -28,6 +28,8 @@ def _child_main(
     autoreset_mode: Any,
 ) -> None:
     """Entry point for the worker process that owns the VectorEnv."""
+    import sys
+
     env: gym.vector.SyncVectorEnv | None = None
     try:
         env_fns = pickle.loads(env_fns_bytes)
@@ -45,28 +47,35 @@ def _child_main(
                 break
 
             cmd = msg[0]
-            if cmd == "reset":
-                _, kwargs = msg
-                result = env.reset(**kwargs)
-                conn.send(("ok", result))
-            elif cmd == "step":
-                _, action = msg
-                result = env.step(action)
-                conn.send(("ok", result))
-            elif cmd == "call":
-                _, name = msg
-                result = env.call(name)
-                conn.send(("ok", result))
-            elif cmd == "render":
-                frames = [e.render() for e in env.envs]
-                conn.send(("ok", frames))
-            elif cmd == "close":
-                break
-            else:
-                conn.send(("error", f"unknown command: {cmd}"))
+            try:
+                if cmd == "reset":
+                    _, kwargs = msg
+                    result = env.reset(**kwargs)
+                    conn.send(("ok", result))
+                elif cmd == "step":
+                    _, action = msg
+                    result = env.step(action)
+                    conn.send(("ok", result))
+                elif cmd == "call":
+                    _, name = msg
+                    result = env.call(name)
+                    conn.send(("ok", result))
+                elif cmd == "render":
+                    frames = [e.render() for e in env.envs]
+                    conn.send(("ok", frames))
+                elif cmd == "close":
+                    break
+                else:
+                    conn.send(("error", f"unknown command: {cmd}"))
+            except Exception:
+                tb = traceback.format_exc()
+                print(f"[ProcessIsolatedEnv child] error handling {cmd!r}:\n{tb}", file=sys.stderr)
+                conn.send(("error", tb))
     except Exception:
+        tb = traceback.format_exc()
+        print(f"[ProcessIsolatedEnv child] fatal error during init:\n{tb}", file=sys.stderr)
         try:
-            conn.send(("error", traceback.format_exc()))
+            conn.send(("error", tb))
         except Exception:
             pass
     finally:
@@ -164,7 +173,15 @@ class ProcessIsolatedVectorEnv:
         child_conn.close()  # parent doesn't use the child end
 
         # Wait for the child to be ready.
-        status, payload = self._parent_conn.recv()
+        try:
+            status, payload = self._parent_conn.recv()
+        except EOFError:
+            self._process.join(timeout=10)
+            raise RuntimeError(
+                f"Child process died before sending data (exit code: {self._process.exitcode}). "
+                "Check stderr for the child traceback. This often means the environment "
+                "crashed during creation (e.g. EGL/MuJoCo init failure)."
+            )
         if status == "error":
             raise RuntimeError(f"Child process failed during init:\n{payload}")
         assert status == "ready"
@@ -232,7 +249,14 @@ class ProcessIsolatedVectorEnv:
         if self._closed:
             raise RuntimeError("Env is closed")
         self._parent_conn.send((cmd, payload) if payload is not None else (cmd,))
-        status, result = self._parent_conn.recv()
+        try:
+            status, result = self._parent_conn.recv()
+        except EOFError:
+            self._process.join(timeout=10)
+            raise RuntimeError(
+                f"Child process died during {cmd!r} (exit code: {self._process.exitcode}). "
+                "Check stderr for the child traceback."
+            )
         if status == "error":
             raise RuntimeError(f"Error in child process:\n{result}")
         return result

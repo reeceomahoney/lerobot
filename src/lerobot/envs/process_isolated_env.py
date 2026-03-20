@@ -162,7 +162,11 @@ class ProcessIsolatedVectorEnv:
         # so they survive the spawn boundary.
         env_fns_bytes = cloudpickle.dumps(list(env_fns))
 
-        ctx = mp.get_context("spawn")  # spawn to get a clean CUDA/EGL state
+        # Use fork: at this point make_env runs before make_policy, so CUDA
+        # is not yet initialised.  fork avoids re-importing native libs (which
+        # can segfault with spawn) while still giving us a separate process
+        # for EGL rendering.
+        ctx = mp.get_context("fork")
         self._parent_conn, child_conn = ctx.Pipe()
         self._process = ctx.Process(
             target=_child_main,

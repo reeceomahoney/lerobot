@@ -1,47 +1,166 @@
-"""Process-isolated VectorEnv wrapper.
+"""Process-isolated VectorEnv wrapper for LIBERO.
 
-Runs a SyncVectorEnv in a separate process so that the environment's
-rendering context (e.g. EGL for MuJoCo/LIBERO) does not interfere with
-CUDA in the main (policy) process.  Communication happens over a single
-``multiprocessing.Connection`` pair — one command at a time, fully
-synchronous.
+Runs each SyncVectorEnv in a separate ``spawn``ed process so that the
+environment's EGL rendering context never coexists with CUDA in the
+policy process.
+
+The parent process **never** imports ``libero`` / ``robosuite`` / MuJoCo.
+Only plain config dicts cross the process boundary — the child imports
+everything from scratch.
 """
 
 from __future__ import annotations
 
 import multiprocessing as mp
-import pickle
 import traceback
-from typing import Any, Callable, Sequence
+from collections import defaultdict
+from typing import Any, Callable
 
-import cloudpickle
 import gymnasium as gym
 import numpy as np
 
 
-# ---- Child process ----------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  Public entry point — called from factory.py instead of create_libero_envs
+# ---------------------------------------------------------------------------
 
 
-def _child_main(
-    conn: mp.connection.Connection,
-    env_fns_bytes: bytes,
-    autoreset_mode: Any,
-) -> None:
-    """Entry point for the worker process that owns the VectorEnv."""
+def create_process_isolated_libero_envs(
+    task: str,
+    n_envs: int,
+    camera_name: str,
+    init_states: bool,
+    gym_kwargs: dict[str, Any] | None,
+    control_mode: str,
+    episode_length: int | None,
+) -> dict[str, dict[int, "ProcessIsolatedVectorEnv"]]:
+    """Create LIBERO envs, each in its own child process.
+
+    Mirrors the return type of ``create_libero_envs`` but every VectorEnv
+    lives in a separate ``spawn``-ed process.  The parent never imports
+    ``libero``.
+    """
+    gym_kwargs = dict(gym_kwargs or {})
+    task_ids_filter = gym_kwargs.pop("task_ids", None)
+
+    suite_names = [s.strip() for s in str(task).split(",") if s.strip()]
+    if not suite_names:
+        raise ValueError("`task` must contain at least one LIBERO suite name.")
+
+    # Discover task IDs in a short-lived child (avoids importing libero here).
+    suite_task_ids = _discover_tasks(suite_names, task_ids_filter)
+
+    print(
+        f"Creating process-isolated LIBERO envs | suites={suite_names} "
+        f"| n_envs(per task)={n_envs} | init_states={init_states}"
+    )
+
+    out: dict[str, dict[int, ProcessIsolatedVectorEnv]] = defaultdict(dict)
+    for suite_name in suite_names:
+        for tid in suite_task_ids[suite_name]:
+            config = {
+                "suite_name": suite_name,
+                "task_id": tid,
+                "n_envs": n_envs,
+                "camera_name": camera_name,
+                "init_states": init_states,
+                "gym_kwargs": gym_kwargs,
+                "control_mode": control_mode,
+                "episode_length": episode_length,
+            }
+            out[suite_name][tid] = ProcessIsolatedVectorEnv(config)
+            print(f"  Built isolated env | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
+
+    return {suite: dict(task_map) for suite, task_map in out.items()}
+
+
+# ---------------------------------------------------------------------------
+#  Task-ID discovery  (short-lived spawn child — no MuJoCo init)
+# ---------------------------------------------------------------------------
+
+
+def _discover_tasks(
+    suite_names: list[str],
+    task_ids_filter: list[int] | None,
+) -> dict[str, list[int]]:
+    """Spawn a tiny child to discover how many tasks each suite has."""
+    ctx = mp.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe()
+    p = ctx.Process(
+        target=_discover_worker,
+        args=(child_conn, suite_names, task_ids_filter),
+        daemon=True,
+    )
+    p.start()
+    child_conn.close()
+    try:
+        status, payload = parent_conn.recv()
+    except EOFError:
+        p.join(timeout=10)
+        raise RuntimeError(
+            f"Task-discovery child died (exit code {p.exitcode}). "
+            "Check stderr for details."
+        )
+    p.join(timeout=10)
+    parent_conn.close()
+    if status == "error":
+        raise RuntimeError(f"Task discovery failed:\n{payload}")
+    return payload
+
+
+def _discover_worker(conn, suite_names, task_ids_filter):
+    """Child: import libero, return {suite: [task_ids]}."""
+    try:
+        from lerobot.envs.libero import _get_suite, _select_task_ids
+
+        result = {}
+        for name in suite_names:
+            suite = _get_suite(name)
+            total = len(suite.tasks)
+            result[name] = _select_task_ids(total, task_ids_filter)
+        conn.send(("ok", result))
+    except Exception:
+        conn.send(("error", traceback.format_exc()))
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+#  Per-env child process
+# ---------------------------------------------------------------------------
+
+
+def _env_worker(conn: mp.connection.Connection, config: dict[str, Any]) -> None:
+    """Entry point for each env child process.
+
+    Imports libero from scratch (clean ``spawn``), creates a single
+    SyncVectorEnv, then serves commands over the pipe.
+    """
     import faulthandler
     import sys
 
-    # Print C-level traceback on SIGSEGV/SIGBUS/etc to stderr.
     faulthandler.enable(file=sys.stderr, all_threads=True)
 
-    env: gym.vector.SyncVectorEnv | None = None
+    env = None
     try:
-        print("[ProcessIsolatedEnv child] unpickling env_fns...", file=sys.stderr, flush=True)
-        env_fns = pickle.loads(env_fns_bytes)
-        print("[ProcessIsolatedEnv child] creating SyncVectorEnv...", file=sys.stderr, flush=True)
-        env = gym.vector.SyncVectorEnv(env_fns, autoreset_mode=autoreset_mode)
+        import gymnasium as gym
+        from lerobot.envs.libero import _get_suite, _make_env_fns, _parse_camera_names
 
-        # Send back metadata the parent needs for proxying.
+        suite = _get_suite(config["suite_name"])
+        camera_names = _parse_camera_names(config["camera_name"])
+        fns = _make_env_fns(
+            suite=suite,
+            suite_name=config["suite_name"],
+            task_id=config["task_id"],
+            n_envs=config["n_envs"],
+            camera_names=camera_names,
+            episode_length=config["episode_length"],
+            init_states=config["init_states"],
+            gym_kwargs=config["gym_kwargs"],
+            control_mode=config["control_mode"],
+        )
+        env = gym.vector.SyncVectorEnv(fns, autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP)
+
         meta = _collect_metadata(env)
         conn.send(("ready", meta))
 
@@ -75,11 +194,11 @@ def _child_main(
                     conn.send(("error", f"unknown command: {cmd}"))
             except Exception:
                 tb = traceback.format_exc()
-                print(f"[ProcessIsolatedEnv child] error handling {cmd!r}:\n{tb}", file=sys.stderr)
+                print(f"[ProcessIsolatedEnv child] error in {cmd!r}:\n{tb}", file=sys.stderr)
                 conn.send(("error", tb))
     except Exception:
         tb = traceback.format_exc()
-        print(f"[ProcessIsolatedEnv child] fatal error during init:\n{tb}", file=sys.stderr)
+        print(f"[ProcessIsolatedEnv child] fatal error:\n{tb}", file=sys.stderr)
         try:
             conn.send(("error", tb))
         except Exception:
@@ -93,7 +212,7 @@ def _child_main(
         conn.close()
 
 
-def _collect_metadata(env: gym.vector.SyncVectorEnv) -> dict[str, Any]:
+def _collect_metadata(env) -> dict[str, Any]:
     """Gather picklable metadata from the live env for the parent proxy."""
     sub_attrs: list[dict[str, Any]] = []
     for e in env.envs:
@@ -116,7 +235,9 @@ def _collect_metadata(env: gym.vector.SyncVectorEnv) -> dict[str, Any]:
     }
 
 
-# ---- Proxy objects for env.envs[i] -----------------------------------------
+# ---------------------------------------------------------------------------
+#  Proxy objects for env.envs[i]
+# ---------------------------------------------------------------------------
 
 
 class _SubEnvProxy:
@@ -138,59 +259,39 @@ class _SubEnvProxy:
         return self._render_fn()
 
 
-# ---- Parent-side wrapper ----------------------------------------------------
+# ---------------------------------------------------------------------------
+#  Parent-side wrapper
+# ---------------------------------------------------------------------------
 
 
 class ProcessIsolatedVectorEnv:
     """A VectorEnv whose underlying environments live in a separate process.
 
     Presents the same interface that ``rollout()`` and helper functions in
-    ``lerobot.envs.utils`` expect:
-
-    * ``reset(seed=...)`` / ``step(action)``
-    * ``call(name)``
-    * ``num_envs``  (int property)
-    * ``envs``      (list of proxy objects with cached attributes)
-    * ``close()``
+    ``lerobot.envs.utils`` expect.
     """
 
-    def __init__(
-        self,
-        env_fns: Sequence[Callable[[], Any]],
-        autoreset_mode: Any = None,
-    ) -> None:
+    def __init__(self, config: dict[str, Any]) -> None:
         self._closed = False
 
-        if autoreset_mode is None:
-            autoreset_mode = gym.vector.AutoresetMode.NEXT_STEP
-
-        # Serialize env_fns with cloudpickle (handles closures, lambdas, etc.)
-        # so they survive the spawn boundary.
-        env_fns_bytes = cloudpickle.dumps(list(env_fns))
-
-        # Use fork: at this point make_env runs before make_policy, so CUDA
-        # is not yet initialised.  fork avoids re-importing native libs (which
-        # can segfault with spawn) while still giving us a separate process
-        # for EGL rendering.
-        ctx = mp.get_context("fork")
+        ctx = mp.get_context("spawn")
         self._parent_conn, child_conn = ctx.Pipe()
         self._process = ctx.Process(
-            target=_child_main,
-            args=(child_conn, env_fns_bytes, autoreset_mode),
+            target=_env_worker,
+            args=(child_conn, config),
             daemon=True,
         )
         self._process.start()
-        child_conn.close()  # parent doesn't use the child end
+        child_conn.close()
 
         # Wait for the child to be ready.
         try:
             status, payload = self._parent_conn.recv()
         except EOFError:
-            self._process.join(timeout=10)
+            self._process.join(timeout=30)
             raise RuntimeError(
                 f"Child process died before sending data (exit code: {self._process.exitcode}). "
-                "Check stderr for the child traceback. This often means the environment "
-                "crashed during creation (e.g. EGL/MuJoCo init failure)."
+                "Check stderr for the child traceback."
             )
         if status == "error":
             raise RuntimeError(f"Child process failed during init:\n{payload}")
@@ -249,7 +350,6 @@ class ProcessIsolatedVectorEnv:
         return self._send("render")
 
     def _render_one(self, idx: int) -> np.ndarray:
-        """Render a single sub-env (used by _SubEnvProxy.render)."""
         frames = self.render()
         return frames[idx]
 

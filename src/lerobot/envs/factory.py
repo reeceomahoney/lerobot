@@ -171,6 +171,11 @@ def make_env(
         if cfg.task is None:
             raise ValueError("LiberoEnv requires a task to be specified")
 
+        if getattr(cfg, "process_isolation", False):
+            from lerobot.envs.process_isolated_env import ProcessIsolatedVectorEnv
+
+            env_cls = ProcessIsolatedVectorEnv
+
         return create_libero_envs(
             task=cfg.task,
             n_envs=n_envs,

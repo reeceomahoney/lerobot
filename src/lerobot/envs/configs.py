@@ -264,6 +264,8 @@ class LiberoEnv(EnvConfig):
     task_ids: list[int] | None = None
     fps: int = 30
     episode_length: int | None = None
+    # Run the environment in a separate process to avoid CUDA/EGL context conflicts.
+    process_isolation: bool = False
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"

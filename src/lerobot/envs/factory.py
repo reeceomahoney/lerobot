@@ -166,10 +166,24 @@ def make_env(
     env_cls = gym.vector.AsyncVectorEnv if use_async_envs else gym.vector.SyncVectorEnv
 
     if "libero" in cfg.type:
-        from lerobot.envs.libero import create_libero_envs
-
         if cfg.task is None:
             raise ValueError("LiberoEnv requires a task to be specified")
+
+        if getattr(cfg, "process_isolation", False):
+            # Avoid importing libero in this process — the child handles it.
+            from lerobot.envs.process_isolated_env import create_process_isolated_libero_envs
+
+            return create_process_isolated_libero_envs(
+                task=cfg.task,
+                n_envs=n_envs,
+                camera_name=cfg.camera_name,
+                init_states=cfg.init_states,
+                gym_kwargs=cfg.gym_kwargs,
+                control_mode=cfg.control_mode,
+                episode_length=cfg.episode_length,
+            )
+
+        from lerobot.envs.libero import create_libero_envs
 
         return create_libero_envs(
             task=cfg.task,

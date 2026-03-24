@@ -137,11 +137,7 @@ def _env_worker(conn: mp.connection.Connection, config: dict[str, Any]) -> None:
     SyncVectorEnv, then serves commands over the pipe.
     """
     import faulthandler
-    import os
     import sys
-
-    # Prevent CUDA initialization in this process — only EGL rendering happens here.
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     faulthandler.enable(file=sys.stderr, all_threads=True)
 

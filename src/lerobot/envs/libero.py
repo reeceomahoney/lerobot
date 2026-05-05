@@ -34,6 +34,8 @@ from lerobot.types import RobotObservation
 
 from .utils import _LazyAsyncVectorEnv, parse_camera_names
 
+benchmark.print = lambda *a, **k: None
+
 
 def _get_suite(name: str) -> benchmark.Benchmark:
     """Instantiate a LIBERO suite by name with clear validation."""

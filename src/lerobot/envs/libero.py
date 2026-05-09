@@ -27,18 +27,34 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium import spaces
-from libero.libero import benchmark, get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.types import RobotObservation
 
 from .utils import _LazyAsyncVectorEnv, parse_camera_names
 
-benchmark.print = lambda *a, **k: None
+
+def _libero_backend(is_libero_plus: bool):
+    """Resolve the libero backend modules for the requested suite variant.
+
+    Base libero comes from `hf-libero` (provides the `libero` package); the
+    perturbation suites come from our `LIBERO-plus` fork (renamed to
+    `libero_plus` so the two packages can coexist in the same environment).
+    """
+    if is_libero_plus:
+        from libero_plus.libero_plus import benchmark, get_libero_path
+        from libero_plus.libero_plus.envs import OffScreenRenderEnv
+    else:
+        from libero.libero import benchmark, get_libero_path
+        from libero.libero.envs import OffScreenRenderEnv
+    # Suppress per-batch '[info] using task orders [...]' stdout spam from
+    # libero.benchmark.Benchmark.__init__ — fires every time we instantiate.
+    benchmark.print = lambda *a, **k: None
+    return benchmark, get_libero_path, OffScreenRenderEnv
 
 
-def _get_suite(name: str) -> benchmark.Benchmark:
+def _get_suite(name: str, is_libero_plus: bool = False) -> Any:
     """Instantiate a LIBERO suite by name with clear validation."""
+    benchmark, _, _ = _libero_backend(is_libero_plus)
     bench = benchmark.get_benchmark_dict()
     if name not in bench:
         raise ValueError(f"Unknown LIBERO suite '{name}'. Available: {', '.join(sorted(bench.keys()))}")
@@ -67,6 +83,7 @@ _LIBERO_PERTURBATION_SUFFIX_RE = re.compile(r"_(?:language|view|light)_[^.]*|_(?
 
 
 def get_task_init_states(task_suite: Any, i: int, is_libero_plus: bool = False) -> np.ndarray:
+    _, get_libero_path, _ = _libero_backend(is_libero_plus)
     task = task_suite.tasks[i]
     filename = Path(task.init_states_file)
     root = Path(get_libero_path("init_states"))
@@ -172,12 +189,11 @@ class LiberoEnv(gym.Env):
         task = task_suite.get_task(task_id)
         self.task = task.name
         self.task_description = task.language
+        _, get_libero_path, _ = _libero_backend(self.is_libero_plus)
         self._task_bddl_file = os.path.join(
             get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
         )
-        self._env: OffScreenRenderEnv | None = (
-            None  # deferred — created on first reset() inside the worker subprocess
-        )
+        self._env: Any | None = None  # deferred — created on first reset() inside the worker subprocess
 
         default_steps = 500
         self._max_episode_steps = (
@@ -258,6 +274,7 @@ class LiberoEnv(gym.Env):
         """
         if self._env is not None:
             return
+        _, _, OffScreenRenderEnv = _libero_backend(self.is_libero_plus)  # noqa: N806
         env = OffScreenRenderEnv(
             bddl_file_name=self._task_bddl_file,
             camera_heights=self.observation_height,
@@ -471,7 +488,7 @@ def create_libero_envs(
 
     out: dict[str, dict[int, Any]] = defaultdict(dict)
     for suite_name in suite_names:
-        suite = _get_suite(suite_name)
+        suite = _get_suite(suite_name, is_libero_plus=is_libero_plus)
         total = len(suite.tasks)
         selected = _select_task_ids(total, task_ids_filter)
         if not selected:

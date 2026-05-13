@@ -306,15 +306,9 @@ lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 
 # ---------------- Tool Configurations ----------------
 
-# cu126 wheels for GH200 nodes capped at driver 565 / CUDA 12.7.
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true
-
-[tool.uv.sources]
-torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
-torchvision = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
+# Torch CUDA variant is selected by the consumer (e.g. via pixi features /
+# `uv pip install --index-url https://download.pytorch.org/whl/cu126`).
+# No source pin here so this package works on hosts with cu126 or cu128 drivers.
 
 [tool.setuptools.package-data]
 lerobot = ["envs/*.json"]

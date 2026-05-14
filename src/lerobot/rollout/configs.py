@@ -95,6 +95,36 @@ class HighlightStrategyConfig(RolloutStrategyConfig):
     push_key: str = "h"
 
 
+@RolloutStrategyConfig.register_subclass("episodic")
+@dataclass
+class EpisodicStrategyConfig(RolloutStrategyConfig):
+    """Episode-by-episode autonomous recording with manual env reset.
+
+    Each episode records from the first frame until either
+    ``max_episode_steps`` is reached or the user presses ``end_key``.
+    The robot is then smoothly interpolated back to its captured initial
+    position and the loop blocks until the user presses ``next_key`` to
+    start the next episode.
+
+    Policy state (hidden state, RTC queue) is reset between episodes so
+    each rollout starts fresh — appropriate when the human also resets
+    the physical environment.
+    """
+
+    # Hard cap on per-episode length, in control-loop steps. Set to 0 to
+    # disable (rely entirely on the end key).
+    max_episode_steps: int = 400
+    # Key that ends the current episode early (and saves it).
+    end_key: str = "e"
+    # Key that ends the current episode and discards its frames.
+    discard_key: str = "d"
+    # Key that starts the next episode after env reset.
+    next_key: str = "n"
+    # Upload to the Hub after every N saved episodes.  0 disables periodic
+    # pushes; the final push at teardown still runs.
+    upload_every_n_episodes: int = 0
+
+
 @dataclass
 class DAggerKeyboardConfig:
     """Keyboard key bindings for DAgger controls.
@@ -229,14 +259,15 @@ class RolloutConfig:
 
         # TODO(Steven): DAgger shouldn't require a dataset (user may want to just rollout+intervene without recording), but for now we require it to simplify the implementation.
         needs_dataset = isinstance(
-            self.strategy, (SentryStrategyConfig, HighlightStrategyConfig, DAggerStrategyConfig)
+            self.strategy,
+            (SentryStrategyConfig, HighlightStrategyConfig, DAggerStrategyConfig, EpisodicStrategyConfig),
         )
         if needs_dataset and (self.dataset is None or not self.dataset.repo_id):
             raise ValueError(f"{self.strategy.type} strategy requires --dataset.repo_id to be set")
 
         if isinstance(self.strategy, BaseStrategyConfig) and self.dataset is not None:
             raise ValueError(
-                "Base strategy does not record data. Use sentry, highlight, or dagger for recording."
+                "Base strategy does not record data. Use sentry, highlight, episodic, or dagger for recording."
             )
 
         # Sentry MUST use streaming encoding to avoid disk I/O blocking the control loop
@@ -255,6 +286,15 @@ class RolloutConfig:
             and not self.dataset.streaming_encoding
         ):
             logger.warning("Highlight mode forces streaming_encoding=True")
+            self.dataset.streaming_encoding = True
+
+        # Episodic records live during the control loop — streaming is mandatory.
+        if (
+            isinstance(self.strategy, EpisodicStrategyConfig)
+            and self.dataset is not None
+            and not self.dataset.streaming_encoding
+        ):
+            logger.warning("Episodic mode forces streaming_encoding=True")
             self.dataset.streaming_encoding = True
 
         # DAgger: streaming is mandatory only when the autonomous phase is also recorded.

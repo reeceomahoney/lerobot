@@ -18,12 +18,14 @@ import builtins
 import copy
 import logging
 import math
+import os
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+from accelerate import init_empty_weights
 from torch import Tensor, nn
 
 from lerobot.utils.import_utils import _transformers_available, require_package
@@ -968,9 +970,25 @@ class PI05Policy(PreTrainedPolicy):
                 **kwargs,
             )
 
-        # Initialize model without loading weights
-        # Check if dataset_stats were provided in kwargs
-        model = cls(config, **kwargs)
+        # Random-initializing PaliGemma's ~3 B params on CPU costs ~3 minutes
+        # before load_state_dict immediately overwrites them. Construct on the
+        # meta device (no allocation, no init), then materialize weights
+        # directly via load_state_dict(assign=True). Disable with
+        # LEROBOT_PI05_FAST_LOAD=0 if a downstream subclass adds a
+        # non-persistent buffer that the meta-leftover check would flag.
+        fast_load = os.environ.get("LEROBOT_PI05_FAST_LOAD", "1") != "0"
+        if fast_load:
+            # __init__ calls self.model.to(config.device); meta tensors error
+            # on .to(), so neutralize it for the duration of construction.
+            original_module_to = nn.Module.to
+            nn.Module.to = lambda self, *a, **kw: self
+            try:
+                with init_empty_weights(include_buffers=False):
+                    model = cls(config, **kwargs)
+            finally:
+                nn.Module.to = original_module_to
+        else:
+            model = cls(config, **kwargs)
 
         # Load state dict (expects keys with "model." prefix)
         try:
@@ -991,10 +1009,17 @@ class PI05Policy(PreTrainedPolicy):
                 )
                 from safetensors.torch import load_file
 
-                original_state_dict = load_file(resolved_file)
+                load_device = config.device if fast_load else "cpu"
+                original_state_dict = load_file(resolved_file, device=load_device)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
                 print(f"Could not load state dict from remote files: {e}")
+                if fast_load:
+                    raise RuntimeError(
+                        "Fast load failed before materializing weights; "
+                        "model has meta-device parameters. Set "
+                        "LEROBOT_PI05_FAST_LOAD=0 to fall back to the slow path."
+                    ) from e
                 print("Returning model without loading pretrained weights")
                 return model
 
@@ -1017,7 +1042,19 @@ class PI05Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            missing_keys, unexpected_keys = model.load_state_dict(
+                remapped_state_dict, strict=strict, assign=fast_load
+            )
+
+            if fast_load:
+                leftover = [n for n, p in model.named_parameters() if p.is_meta]
+                leftover += [n for n, b in model.named_buffers() if b.is_meta]
+                if leftover:
+                    raise RuntimeError(
+                        f"Fast load left {len(leftover)} tensors on meta device "
+                        f"(first 10: {leftover[:10]}). Set LEROBOT_PI05_FAST_LOAD=0 "
+                        "to fall back to the slow path."
+                    )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")

@@ -103,8 +103,10 @@ class EpisodicStrategyConfig(RolloutStrategyConfig):
     Each episode records from the first frame until either
     ``max_episode_steps`` is reached or the user presses ``end_key``.
     The robot is then smoothly interpolated back to its captured initial
-    position and the loop blocks until the user presses ``next_key`` to
-    start the next episode.
+    position and the loop blocks until the user labels the episode as
+    success (``success_key``) or failure (``failure_key``); the label is
+    written to a per-frame ``success`` bool column and the next episode
+    starts immediately afterward.
 
     Policy state (hidden state, RTC queue) is reset between episodes so
     each rollout starts fresh — appropriate when the human also resets
@@ -118,8 +120,9 @@ class EpisodicStrategyConfig(RolloutStrategyConfig):
     end_key: str = "e"
     # Key that ends the current episode and discards its frames.
     discard_key: str = "d"
-    # Key that starts the next episode after env reset.
-    next_key: str = "n"
+    # Keys that label the episode as success / failure and start the next one.
+    success_key: str = "s"
+    failure_key: str = "f"
     # Upload to the Hub after every N saved episodes.  0 disables periodic
     # pushes; the final push at teardown still runs.
     upload_every_n_episodes: int = 0

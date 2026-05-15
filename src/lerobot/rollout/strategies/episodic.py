@@ -21,6 +21,8 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event, Lock
 
+import numpy as np
+
 from lerobot.datasets import VideoEncodingManager
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
@@ -43,10 +45,12 @@ class EpisodicStrategy(RolloutStrategy):
     1. Reset the inference engine (clear hidden state / RTC queue).
     2. Run the policy until either ``max_episode_steps`` is reached or
        the user presses ``end_key``.
-    3. Save the episode and (optionally) push to the Hub.
-    4. Smoothly interpolate the robot back to its captured initial
+    3. Smoothly interpolate the robot back to its captured initial
        position via :meth:`RolloutStrategy._return_to_initial_position`.
-    5. Block until the user presses ``next_key`` (or shutdown).
+    4. Block until the user labels the episode as success (``success_key``)
+       or failure (``failure_key``); the label is written to every frame's
+       ``success`` column.
+    5. Save the episode and (optionally) push to the Hub.
 
     Requires ``streaming_encoding=True`` (enforced in config validation)
     so ``dataset.add_frame`` does not block the control loop.
@@ -58,7 +62,8 @@ class EpisodicStrategy(RolloutStrategy):
         super().__init__(config)
         self._end_episode = Event()
         self._discard_episode = Event()
-        self._start_next = Event()
+        self._mark_success = Event()
+        self._mark_failure = Event()
         self._listener = None
         self._push_executor: ThreadPoolExecutor | None = None
         self._pending_push: Future | None = None
@@ -69,11 +74,12 @@ class EpisodicStrategy(RolloutStrategy):
         self._push_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="episodic-push")
         self._setup_keyboard(ctx.runtime.shutdown_event)
         logger.info(
-            "Episodic strategy ready (max_episode_steps=%d, end='%s', discard='%s', next='%s')",
+            "Episodic strategy ready (max_episode_steps=%d, end='%s', discard='%s', success='%s', failure='%s')",
             self.config.max_episode_steps,
             self.config.end_key,
             self.config.discard_key,
-            self.config.next_key,
+            self.config.success_key,
+            self.config.failure_key,
         )
 
     def run(self, ctx: RolloutContext) -> None:
@@ -105,6 +111,8 @@ class EpisodicStrategy(RolloutStrategy):
                 self._cached_obs_processed = None
                 self._end_episode.clear()
                 self._discard_episode.clear()
+                self._mark_success.clear()
+                self._mark_failure.clear()
                 engine.resume()
 
                 logger.info(
@@ -122,47 +130,68 @@ class EpisodicStrategy(RolloutStrategy):
                         dataset.clear_episode_buffer()
                     logger.info("Episode discarded (steps=%d)", steps)
                     log_say("Episode discarded", play_sounds)
-                else:
-                    end_reason = (
-                        "user" if self._end_episode.is_set()
-                        else ("max_steps" if max_steps > 0 and steps >= max_steps else "shutdown")
-                    )
-                    with self._episode_lock:
-                        dataset.save_episode()
-                    logger.info(
-                        "Episode %d saved (steps=%d, reason=%s)",
-                        dataset.num_episodes,
-                        steps,
-                        end_reason,
-                    )
-                    log_say(f"Episode {dataset.num_episodes} saved", play_sounds)
+                    if ctx.runtime.shutdown_event.is_set():
+                        break
+                    continue
 
-                    episodes_since_push += 1
-                    if (
-                        self.config.upload_every_n_episodes > 0
-                        and episodes_since_push >= self.config.upload_every_n_episodes
-                    ):
-                        self.background_push(dataset, cfg)
-                        episodes_since_push = 0
-
-                if ctx.runtime.shutdown_event.is_set():
-                    break
-
-                # Pause inference, drift the arm back home, then wait for the
-                # human to reset the scene before kicking off the next episode.
+                # Pause inference and drift the arm home before asking the
+                # operator to label the episode.
                 engine.pause()
                 logger.info("Returning robot to initial position...")
                 if ctx.hardware.initial_position:
                     self._return_to_initial_position(ctx.hardware)
 
                 logger.info(
-                    "Reset the environment, then press '%s' to start the next episode (ESC to stop).",
-                    self.config.next_key,
+                    "Reset the environment, then press '%s' for success or '%s' for failure (ESC to stop).",
+                    self.config.success_key,
+                    self.config.failure_key,
                 )
-                log_say("Reset the environment", play_sounds)
-                self._start_next.clear()
-                while not self._start_next.is_set() and not ctx.runtime.shutdown_event.is_set():
+                log_say("Mark success or failure", play_sounds)
+                while (
+                    not self._mark_success.is_set()
+                    and not self._mark_failure.is_set()
+                    and not ctx.runtime.shutdown_event.is_set()
+                ):
                     precise_sleep(0.05)
+
+                if ctx.runtime.shutdown_event.is_set():
+                    # Drop the unlabeled episode rather than guess a label.
+                    with self._episode_lock:
+                        dataset.clear_episode_buffer()
+                    logger.info("Shutdown before labeling — episode discarded")
+                    break
+
+                success_label = self._mark_success.is_set()
+                buf = dataset.writer.episode_buffer
+                buf["success"] = [
+                    np.array([success_label], dtype=bool) for _ in range(buf["size"])
+                ]
+
+                end_reason = (
+                    "user" if self._end_episode.is_set()
+                    else ("max_steps" if max_steps > 0 and steps >= max_steps else "shutdown")
+                )
+                with self._episode_lock:
+                    dataset.save_episode()
+                logger.info(
+                    "Episode %d saved (steps=%d, reason=%s, success=%s)",
+                    dataset.num_episodes,
+                    steps,
+                    end_reason,
+                    success_label,
+                )
+                log_say(
+                    f"Episode {dataset.num_episodes} saved as {'success' if success_label else 'failure'}",
+                    play_sounds,
+                )
+
+                episodes_since_push += 1
+                if (
+                    self.config.upload_every_n_episodes > 0
+                    and episodes_since_push >= self.config.upload_every_n_episodes
+                ):
+                    self.background_push(dataset, cfg)
+                    episodes_since_push = 0
 
     def run_episode(
         self,
@@ -199,7 +228,14 @@ class EpisodicStrategy(RolloutStrategy):
                 self._log_telemetry(obs_processed, action_dict, ctx.runtime)
                 obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                 action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
-                frame = {**obs_frame, **action_frame, "task": task_str}
+                # `success` is a placeholder here; the real episode-level
+                # label is patched into the buffer after the user marks it.
+                frame = {
+                    **obs_frame,
+                    **action_frame,
+                    "task": task_str,
+                    "success": np.array([False], dtype=bool),
+                }
                 dataset.add_frame(frame)
                 steps += 1
 
@@ -249,7 +285,8 @@ class EpisodicStrategy(RolloutStrategy):
     def _setup_keyboard(self, shutdown_event: Event) -> None:
         end_key = self.config.end_key
         discard_key = self.config.discard_key
-        next_key = self.config.next_key
+        success_key = self.config.success_key
+        failure_key = self.config.failure_key
 
         def on_press(ch: str) -> None:
             if ch == end_key:
@@ -257,13 +294,14 @@ class EpisodicStrategy(RolloutStrategy):
             elif ch == discard_key:
                 self._discard_episode.set()
                 self._end_episode.set()
-            elif ch == next_key:
-                self._start_next.set()
+            elif ch == success_key:
+                self._mark_success.set()
+            elif ch == failure_key:
+                self._mark_failure.set()
             elif ch == ESC:
                 # Treat ESC as both end-of-episode and shutdown so the
                 # inner loop unblocks promptly.
                 self._end_episode.set()
-                self._start_next.set()
                 shutdown_event.set()
 
         self._listener = StdinKeyListener(on_press)
@@ -272,10 +310,11 @@ class EpisodicStrategy(RolloutStrategy):
             logger.warning("Keyboard listener disabled (stdin not a TTY)")
             return
         logger.info(
-            "Keyboard listener started (end='%s', discard='%s', next='%s', ESC=stop)",
+            "Keyboard listener started (end='%s', discard='%s', success='%s', failure='%s', ESC=stop)",
             end_key,
             discard_key,
-            next_key,
+            success_key,
+            failure_key,
         )
 
     def background_push(self, dataset, cfg) -> None:

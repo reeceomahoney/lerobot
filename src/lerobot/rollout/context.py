@@ -48,7 +48,7 @@ from lerobot.robots import make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 
-from .configs import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig
+from .configs import BaseStrategyConfig, DAggerStrategyConfig, EpisodicStrategyConfig, RolloutConfig
 from .inference import (
     InferenceEngine,
     RTCInferenceConfig,
@@ -343,6 +343,12 @@ def build_rollout_context(
         else:
             if isinstance(cfg.strategy, DAggerStrategyConfig):
                 dataset_features["intervention"] = {
+                    "dtype": "bool",
+                    "shape": (1,),
+                    "names": None,
+                }
+            if isinstance(cfg.strategy, EpisodicStrategyConfig):
+                dataset_features["success"] = {
                     "dtype": "bool",
                     "shape": (1,),
                     "names": None,

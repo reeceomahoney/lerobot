@@ -16,38 +16,21 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
-import os
-import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event, Lock
 
-from lerobot.common.control_utils import is_headless
 from lerobot.datasets import VideoEncodingManager
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
-from lerobot.utils.import_utils import _pynput_available, require_package
 from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.stdin_keys import ESC, StdinKeyListener
 from lerobot.utils.utils import log_say
 
 from ..configs import EpisodicStrategyConfig
 from ..context import RolloutContext
 from .core import RolloutStrategy, safe_push_to_hub, send_next_action
-
-PYNPUT_AVAILABLE = _pynput_available
-keyboard = None
-if PYNPUT_AVAILABLE:
-    try:
-        if ("DISPLAY" not in os.environ) and ("linux" in sys.platform):
-            logging.info("No DISPLAY set. Skipping pynput import.")
-            PYNPUT_AVAILABLE = False
-        else:
-            from pynput import keyboard
-    except Exception as e:
-        PYNPUT_AVAILABLE = False
-        logging.info(f"Could not import pynput: {e}")
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +56,6 @@ class EpisodicStrategy(RolloutStrategy):
 
     def __init__(self, config: EpisodicStrategyConfig):
         super().__init__(config)
-        require_package("pynput", extra="pynput-dep")
         self._end_episode = Event()
         self._discard_episode = Event()
         self._start_next = Event()
@@ -265,41 +247,36 @@ class EpisodicStrategy(RolloutStrategy):
         logger.info("Episodic strategy teardown complete")
 
     def _setup_keyboard(self, shutdown_event: Event) -> None:
-        if is_headless():
-            logger.warning("Headless environment — episodic keys unavailable")
+        end_key = self.config.end_key
+        discard_key = self.config.discard_key
+        next_key = self.config.next_key
+
+        def on_press(ch: str) -> None:
+            if ch == end_key:
+                self._end_episode.set()
+            elif ch == discard_key:
+                self._discard_episode.set()
+                self._end_episode.set()
+            elif ch == next_key:
+                self._start_next.set()
+            elif ch == ESC:
+                # Treat ESC as both end-of-episode and shutdown so the
+                # inner loop unblocks promptly.
+                self._end_episode.set()
+                self._start_next.set()
+                shutdown_event.set()
+
+        self._listener = StdinKeyListener(on_press)
+        if not self._listener.start():
+            self._listener = None
+            logger.warning("Keyboard listener disabled (stdin not a TTY)")
             return
-
-        try:
-            end_key = self.config.end_key
-            discard_key = self.config.discard_key
-            next_key = self.config.next_key
-
-            def on_press(key):
-                with contextlib.suppress(Exception):
-                    if hasattr(key, "char") and key.char == end_key:
-                        self._end_episode.set()
-                    elif hasattr(key, "char") and key.char == discard_key:
-                        self._discard_episode.set()
-                        self._end_episode.set()
-                    elif hasattr(key, "char") and key.char == next_key:
-                        self._start_next.set()
-                    elif key == keyboard.Key.esc:
-                        # Treat ESC as both end-of-episode and shutdown so the
-                        # inner loop unblocks promptly.
-                        self._end_episode.set()
-                        self._start_next.set()
-                        shutdown_event.set()
-
-            self._listener = keyboard.Listener(on_press=on_press)
-            self._listener.start()
-            logger.info(
-                "Keyboard listener started (end='%s', discard='%s', next='%s', ESC=stop)",
-                end_key,
-                discard_key,
-                next_key,
-            )
-        except ImportError:
-            logger.warning("pynput not available — keyboard listener disabled")
+        logger.info(
+            "Keyboard listener started (end='%s', discard='%s', next='%s', ESC=stop)",
+            end_key,
+            discard_key,
+            next_key,
+        )
 
     def background_push(self, dataset, cfg) -> None:
         if self._push_executor is None:

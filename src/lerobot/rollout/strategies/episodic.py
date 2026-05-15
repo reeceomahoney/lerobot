@@ -125,41 +125,68 @@ class EpisodicStrategy(RolloutStrategy):
 
                 steps = self.run_episode(ctx, control_interval, max_steps, features, task_str)
 
-                if self._discard_episode.is_set():
+                discarded = self._discard_episode.is_set()
+                if discarded:
                     with self._episode_lock:
                         dataset.clear_episode_buffer()
                     logger.info("Episode discarded (steps=%d)", steps)
                     log_say("Episode discarded", play_sounds)
-                    if ctx.runtime.shutdown_event.is_set():
-                        break
-                    continue
 
-                # Pause inference and drift the arm home before asking the
-                # operator to label the episode.
+                # Re-arm so `discard_key` works again during the label prompt
+                # below (it's the operator's escape hatch for misclicks).
+                self._discard_episode.clear()
+
+                # Pause inference and drift the arm home, then wait for the
+                # operator to reset the scene.  The same post-episode path
+                # runs whether the episode was saved or discarded so the
+                # robot doesn't barrel into the next attempt mid-motion.
                 engine.pause()
                 logger.info("Returning robot to initial position...")
                 if ctx.hardware.initial_position:
                     self._return_to_initial_position(ctx.hardware)
 
-                logger.info(
-                    "Reset the environment, then press '%s' for success or '%s' for failure (ESC to stop).",
-                    self.config.success_key,
-                    self.config.failure_key,
-                )
-                log_say("Mark success or failure", play_sounds)
+                if discarded:
+                    logger.info(
+                        "Reset the environment, then press '%s' or '%s' to continue (ESC to stop).",
+                        self.config.success_key,
+                        self.config.failure_key,
+                    )
+                    log_say("Reset the environment", play_sounds)
+                else:
+                    logger.info(
+                        "Reset the environment, then press '%s' for success, '%s' for failure, or '%s' to discard (ESC to stop).",
+                        self.config.success_key,
+                        self.config.failure_key,
+                        self.config.discard_key,
+                    )
+                    log_say("Mark success or failure", play_sounds)
                 while (
                     not self._mark_success.is_set()
                     and not self._mark_failure.is_set()
+                    and not self._discard_episode.is_set()
                     and not ctx.runtime.shutdown_event.is_set()
                 ):
                     precise_sleep(0.05)
 
                 if ctx.runtime.shutdown_event.is_set():
-                    # Drop the unlabeled episode rather than guess a label.
+                    if not discarded:
+                        # Drop the unlabeled episode rather than guess a label.
+                        with self._episode_lock:
+                            dataset.clear_episode_buffer()
+                        logger.info("Shutdown before labeling — episode discarded")
+                    break
+
+                if not discarded and self._discard_episode.is_set():
+                    # Operator chose to throw away the just-finished episode
+                    # at the label prompt instead of marking it.
                     with self._episode_lock:
                         dataset.clear_episode_buffer()
-                    logger.info("Shutdown before labeling — episode discarded")
-                    break
+                    logger.info("Episode discarded at label prompt (steps=%d)", steps)
+                    log_say("Episode discarded", play_sounds)
+                    discarded = True
+
+                if discarded:
+                    continue
 
                 success_label = self._mark_success.is_set()
                 buf = dataset.writer.episode_buffer

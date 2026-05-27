@@ -208,7 +208,7 @@ def build_rollout_context(
     policy.eval()
     logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
 
-    if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
+    if cfg.use_torch_compile and not hasattr(policy_config, "compile_model"):
         try:
             if hasattr(torch, "compile"):
                 compile_kwargs = {
